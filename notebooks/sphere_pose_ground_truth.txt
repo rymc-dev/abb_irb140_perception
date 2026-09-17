@@ -1,0 +1,8 @@
+
+Requesting state for world [robot_lab]...
+
+Model: [12]
+  - Name: my_sphere
+  - Pose [ XYZ (m) ] [ RPY (rad) ]:
+    [0.705000 0.014790 1.086900]
+    [-0.739514 0.000000 -0.000000]

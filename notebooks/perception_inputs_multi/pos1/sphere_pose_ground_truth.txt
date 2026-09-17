@@ -1,0 +1,9 @@
+
+Requesting state for world [robot_lab]...
+
+[1;33mWarning [Utils.cc:132][0m [/sdf/model[@name="abb_irb140"]/link[@name="depth_camera"]/sensor[@name="rgbd_camera"]/gz_frame_id:<data-string>:L1242]: XML Element[gz_frame_id], child of element[sensor], not defined in SDF. Copying[gz_frame_id] as children of [sensor].
+Model: [12]
+  - Name: my_sphere
+  - Pose [ XYZ (m) ] [ RPY (rad) ]:
+    [0.570000 0.158889 1.086870]
+    [-0.444467 0.000000 -0.000000]
