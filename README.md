@@ -1,239 +1,291 @@
 # abb_irb140_perception
 
-ROS 2 (Jazzy) perception node for detecting a ball with an eye-in-hand RGB-D
-camera mounted on the ABB IRB140's gripper, and publishing its 3D position as
-a `base_link -> ball` TF transform (plus `visualization_msgs/MarkerArray` and
-`vision_msgs/Detection3DArray`) for downstream motion/pick logic.
+ROS 2 (Jazzy) perception for the ABB IRB140 with an eye-in-hand RGB-D camera
+mounted on the gripper. A YOLO detector finds a ball in the RGB image, the
+aligned depth image gives its range, and TF2 turns that into a position in
+`base_link`. The result is published as a `base_link -> ball` transform, a
+`vision_msgs/Detection3DArray`, and an RViz `MarkerArray`, for the downstream
+motion/pick logic (e.g. `abb_irb140_motion_control`'s `ball_follow_node`, which
+reads the `ball` TF).
 
-Node: `abb_irb140_perception_node` (`abb_irb140_perception/perception_node.py`),
-launched via `launch/abb_irb140_perception.launch.py`.
+The same node runs unchanged in Gazebo and on the real robot: it always
+back-projects into `depth_camera_optical` and lets TF2 do the rest.
 
-## Known issue: ball TF jumped to the wrong position while the arm was moving
+| | |
+|---|---|
+| Executable | `abb_irb140_perception_node` (`abb_irb140_perception/perception_node.py`) |
+| ROS node | `/hybraut/ball_detector` (class `BallDetector`, namespace `hybraut`) |
+| Launch file | `launch/abb_irb140_perception.launch.py` |
 
-**Symptom:** the published `base_link -> ball` transform was correct once the
-arm stopped and settled, but became wrong — sometimes by several centimetres —
-while the arm was actively moving, which broke downstream motion/pick logic
-that consumed it.
+## Pipeline
 
-A video demonstrating the problem (ball marker visibly detaching from the
-true ball position during arm motion, then snapping back once the arm stops)
-is at
-[`docs/perception_tranformation_error_while_in_motion.mp4`](docs/perception_tranformation_error_while_in_motion.mp4).
-An earlier video showing the intended perception -> transform pipeline
-working (arm stationary) is at
-[`docs/initial_perception_to_transform_pipeline.mp4`](docs/initial_perception_to_transform_pipeline.mp4).
+```
+RGB ──► YOLO ──► 2D ball box ─┐
+                              ├─► pinhole back-projection ──► depth_camera_optical
+depth (aligned to RGB) ───────┘                                      │
+                                                                     │ TF2, looked up at the
+                                                                     │ depth image's capture stamp
+                                                                     ▼
+                                          base_link ──► Detection3DArray
+                                                    ──► MarkerArray
+                                                    ──► TF  base_link -> ball
+```
 
-### Diagnosis
+1. `ApproximateTimeSynchronizer` (`queue_size=5`, `slop=0.05` s) pairs an RGB
+   and a depth image.
+2. YOLO runs on the RGB frame; only classes in `target_classes` are kept.
+3. For each box, the centre pixel is back-projected through the depth image
+   (`hybraut_irb140.perception_geometry.backproject_pixel`). Depth is the
+   **minimum valid** reading in a `(2·depth_window_px + 1)²` window; readings
+   at or below `min_valid_depth_m` are ignored so the gripper's own fingers
+   can't be mistaken for the ball.
+4. The depth reading is the ball's near surface, so the point is pushed back
+   along the optical Z axis by one estimated radius
+   (`r = r_px · z / fx`, with `r_px` the mean half-size of the box) to
+   approximate the sphere centre.
+5. The point is stamped `camera_optical_frame` at the depth image's stamp and
+   transformed to `base_frame` with TF2 (see [TF and timing](#tf-and-timing)).
+6. Outputs are published (below). Ball orientation is always identity.
 
-To debug this without needing to reproduce it live, a rosbag was recorded
-covering `/tf`, `/tf_static`, and `/joint_states` while the ball detector ran
-against a physically stationary ball
-(`bags/rosbag2_2026_09_17-17_14_02/`), together with the ball's ground-truth
-pose in the sim (`bags/ball_ground_truth.txt`).
+The frame the point is assigned to is always the `camera_optical_frame`
+parameter, **not** the `frame_id` in `CameraInfo`. This matters in simulation,
+where the camera's `CameraInfo` reports `depth_camera` (the body-convention
+frame) rather than `depth_camera_optical`.
 
-Since the ball never actually moved, its true `base_link`-frame position
-should have been constant throughout the recording. Instead, the published
-`base_link -> ball` transform swung by **~7.7 cm in x, ~22.3 cm in y, and
-~7.3 cm in z** over the ~20 s recording — and each swing tracked periods
-where `/joint_states` was actively changing (the arm moving), snapping back
-to a stable value every time the arm paused. That is the "perfect when
-stopped, wrong while moving" symptom exactly, and it's a systematic
-computation error correlated with motion, not sensor noise.
+## Requirements
 
-### Root cause
+- **`hybraut_irb140`** (sibling package in this workspace). This node imports
+  `hybraut_irb140.perception_geometry` (`backproject_pixel`, `depth_to_meters`)
+  and, when `model_path` is empty, looks for
+  `share/hybraut_irb140/weights/ball_yolo.pt`. `package.xml` in this package
+  does not yet declare these dependencies, so build `hybraut_irb140` first.
+- **Python:** `ultralytics` and `torch` (pip). A CUDA build of torch is needed
+  for the launch file's default `device: "0"`.
+- **ROS packages:** `cv_bridge`, `image_geometry`, `message_filters`,
+  `tf2_ros`, `tf2_geometry_msgs`, `vision_msgs`, `visualization_msgs`.
+- **A camera** publishing RGB, depth and `CameraInfo`. The depth image must be
+  registered to the colour image, because pixel coordinates from the RGB box
+  index straight into depth. Depth may be `32FC1` metres (Gazebo) or `16UC1`
+  millimetres (RealSense-style); both are handled.
+- **A TF tree** that connects `depth_camera_optical` to `base_link`, published
+  from live `/joint_states`. In this rig that is
+  `tool0 → pneumatic_gripper_base_link → depth_camera → depth_camera_optical`.
+  The `depth_camera → depth_camera_optical` fixed rotation must be in the URDF.
 
-The camera is eye-in-hand
-(`tool0 -> pneumatic_gripper_base_link -> depth_camera -> depth_camera_optical`,
-all published dynamically by `robot_state_publisher` from `/joint_states`), so
-the camera's pose relative to `base_link` changes continuously while the arm
-moves. Each detected ball position has to be transformed from the camera's
-optical frame into `base_link` using the TF tree *as it was at the instant
-the depth image was captured* — using any other instant's pose introduces a
-position error proportional to how far the arm moved in between.
+### Model weights
 
-`_transform_point()` in `perception_node.py` looked up that transform at the
-depth image's exact capture timestamp, but if TF publication hadn't caught up
-yet (`tf2_ros.ExtrapolationException` — common under simulation/CPU load), it
-silently fell back to whatever the **latest available** transform was, with
-no check on how stale that fallback actually was. While the arm was
-stationary this fallback was harmless (every available transform was
-identical, since the pose wasn't changing) — which is exactly why the bug was
-invisible at rest and only appeared during motion.
+With `model_path` empty the node uses `ball_yolo.pt` from the
+`hybraut_irb140` share directory if it exists, otherwise `yolov8n.pt` (looked
+up by ultralytics, so it is downloaded or read from the current directory).
+A generic COCO model may or may not pick up the synthetic Gazebo sphere as
+`sports ball`, so a fine-tuned model is more reliable. Set `model_path` to use
+your own weights.
 
-A smaller, compounding issue: the point used for the TF lookup was stamped
-from the depth image (`depth_msg.header.stamp`), but the *published*
-TF/marker/Detection3D outputs were stamped from the RGB image
-(`rgb_msg.header.stamp`) instead. RGB and depth are only approximately
-time-synced (`message_filters.ApproximateTimeSynchronizer(..., slop=0.05)`),
-so these could differ by up to 50 ms — a second, smaller source of the same
-class of temporal-mismatch error.
+## Build and run
 
-### Fix
+```bash
+cd ~/ros2_ws
+colcon build --packages-select abb_irb140_perception
+source install/setup.bash
 
-Both changes are in `abb_irb140_perception/perception_node.py`:
+# Simulation (Gazebo clock)
+ros2 launch abb_irb140_perception abb_irb140_perception.launch.py use_sim_time:=true
 
-1. **Bounded the "latest transform" fallback.** `_transform_point()` now
-   only accepts the fallback transform if it is within a new
-   `max_tf_staleness` parameter (default `0.03` s / 30 ms) of the point's
-   true capture time — measured against the *actual* evaluation time TF2
-   stamps the transformed point with, not just how long the lookup took. If
-   the fallback is staler than that, the detection is dropped (no
-   TF/marker/Detection3D published for that frame) instead of published with
-   a wrong, motion-proportional position. A momentarily missing detection is
-   far safer for downstream motion/pick logic than a confidently wrong one.
-   Also raised `tf_timeout` from `0.1` s to `0.15` s, giving TF2's own
-   bounded wait (`Buffer.transform(..., timeout=...)` genuinely blocks until
-   the requested stamp becomes available, not just an instant check) more
-   room to absorb ordinary publish jitter before falling back at all.
+# Real robot (wall clock; this is the launch default)
+ros2 launch abb_irb140_perception abb_irb140_perception.launch.py
+```
 
-   `max_tf_staleness` is sized as roughly
-   `acceptable_position_error / max_expected_tool_speed`: at a plausible
-   eye-in-hand approach speed of ~0.3-0.5 m/s, 30 ms of staleness bounds the
-   induced position error to ~1-1.5 cm. Retune it against this rig's actual
-   max end-effector speed during approach/pick motions if needed. Setting it
-   to `0` disables the fallback entirely (strict "exact stamp within
-   `tf_timeout`, or drop the detection").
+`use_sim_time` defaults to `false`, so in simulation pass `use_sim_time:=true`
+to put the node on the Gazebo clock like the rest of the stack.
 
-2. **Made the timestamp used for the ball's position consistent.** The point
-   backprojected from the depth image, the TF lookup, and everything
-   published for that detection (`Detection3DArray.header.stamp`,
-   `Marker.header.stamp`, `TransformStamped.header.stamp`) now all use
-   `depth_msg.header.stamp` instead of mixing in `rgb_msg.header.stamp` —
-   removing the up-to-50ms RGB/depth sync gap as a second source of the same
-   error class. (The annotated RGB debug image is unaffected and still
-   correctly carries the RGB frame's own header.)
+The launch file sets `device: "0"` (first CUDA GPU). To run without a GPU, run
+the executable directly and override it, but see the
+[inference backlog note](#tf-and-timing) first:
 
-New parameters (both on `abb_irb140_perception_node`):
+```bash
+ros2 run abb_irb140_perception abb_irb140_perception_node \
+  --ros-args -p device:=cpu -p imgsz:=320
+```
+
+## Interface
+
+### Subscribed
+
+| Topic (default) | Type | Parameter |
+|---|---|---|
+| `/camera/color/image_raw` | `sensor_msgs/Image` | `rgb_topic` |
+| `/camera/depth/image_rect_raw` | `sensor_msgs/Image` | `depth_topic` |
+| `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | `camera_info_topic` |
+| `/tf`, `/tf_static` | | |
+
+Nothing is published until the first `CameraInfo` arrives.
+
+### Published
+
+| Output | Type | Notes |
+|---|---|---|
+| `/hybraut/hybraut_irb140/ball_detections_3d` | `vision_msgs/Detection3DArray` | `frame_id = base_frame`. Box centre = ball centre; box size = estimated diameter; one hypothesis with `class_id` and YOLO score. |
+| `/hybraut/hybraut_irb140/ball_markers` | `visualization_msgs/MarkerArray` | Green translucent spheres, namespace `marker_ns`. Markers for balls that disappeared are deleted. |
+| `/hybraut/hybraut_irb140/ball_detections/image` | `sensor_msgs/Image` | RGB frame with boxes and labels; carries the RGB image's own header. |
+| TF `base_link -> ball` | | Named `<tf_frame>` for one ball, `<tf_frame>_0`, `<tf_frame>_1`, … for several. Identity rotation. |
+
+The output topic names are absolute and hard-coded; they are not affected by
+the node namespace or remapped by parameters. Publishers can be turned off
+individually with `publish_detections_3d`, `publish_markers` and
+`publish_annotated`.
+
+Detection3D, ADD markers and the ball TF are all stamped with the **depth**
+image's timestamp (the instant the position was measured).
+
+## Parameters
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `tf_timeout` | `0.15` (was `0.1`) | Seconds to let TF2 wait for the transform to become available at the exact capture stamp before falling back. |
-| `max_tf_staleness` | `0.03` | Seconds the fallback ("latest available") transform's own evaluation time may drift from the detection's true capture time before the detection is dropped instead of published. `<= 0` disables the fallback entirely. |
+| `rgb_topic` | `/camera/color/image_raw` | RGB image topic. |
+| `depth_topic` | `/camera/depth/image_rect_raw` | Depth image topic (must be registered to RGB). |
+| `camera_info_topic` | `/camera/color/camera_info` | Intrinsics for the RGB/depth pixel grid. |
+| `base_frame` | `base_link` | Target frame for all outputs. |
+| `camera_optical_frame` | `depth_camera_optical` | Frame the back-projected point is assigned to. Must be the optical frame (x right, y down, z forward). |
+| `model_path` | `""` | YOLO weights. Empty = packaged `ball_yolo.pt`, else `yolov8n.pt`. |
+| `device` | `cpu` (launch file: `"0"`) | Ultralytics device: `cpu`, or a CUDA index as a string. |
+| `confidence_threshold` | `0.15` | YOLO confidence. |
+| `iou_threshold` | `0.45` | YOLO NMS IoU. |
+| `imgsz` | `640` | YOLO inference size. |
+| `max_detections` | `10` | Max boxes per frame. |
+| `target_classes` | `["sports ball", "ball"]` | Class names to keep. Empty = all classes. |
+| `depth_window_px` | `2` | Half-width of the depth sampling window (min-reduced). |
+| `min_valid_depth_m` | `0.05` | Depth at or below this is ignored (gripper self-occlusion guard). |
+| `min_score_for_3d` | `0.0` | Boxes scoring below this are drawn but not localised. |
+| `tf_frame` | `ball` | Child frame name for the ball TF. |
+| `marker_ns` | `ball` | Marker namespace. |
+| `marker_lifetime` | `0.5` | Marker lifetime in seconds. |
+| `marker_alpha` | `0.5` | Marker opacity. |
+| `publish_annotated` | `true` | Publish the annotated RGB image. |
+| `publish_markers` | `true` | Publish the RViz markers. |
+| `publish_detections_3d` | `true` | Publish the `Detection3DArray`. |
+| `tf_timeout` | `0.15` | Seconds TF2 may wait for the transform at the exact capture stamp. |
+| `max_tf_staleness` | `0.03` | Max age (s) of the "latest TF" fallback relative to the capture stamp before the detection is dropped. `<= 0` disables the fallback. |
 
-### A second, separate problem the fix surfaced: CPU-bound inference backlog
+## TF and timing
 
-After deploying the fix above, live testing showed *every* detection being
-dropped with a steady ~4.7 s staleness — far larger than the sub-second
-publish jitter seen in the original diagnostic bag, and not growing/shrinking
-over time. A constant, steady-state gap like that is the signature of the
-node's own processing falling behind the incoming frame rate, not of TF
-publishing being briefly behind: the `device` parameter defaults to `"cpu"`
-(`perception_node.py`), so YOLO inference at `imgsz=640` was running on CPU
-on the same machine as the Gazebo simulation, competing for cycles the sim
-also needed. The `ApproximateTimeSynchronizer(queue_size=5)` lets frames
-queue rather than drop, so each processed frame was already several seconds
-stale by the time `_transform_point()` ran, regardless of how fast the arm
-was actually moving at that instant.
+The camera moves with the arm, so a point measured at time *t* must be
+transformed with the camera pose at time *t*. Any other pose gives an error
+proportional to how far the arm moved in between. `_transform_point()` handles
+this in two steps:
 
-Confirmed a GPU was available and unused (`torch.cuda.is_available() ==
-True`, an NVIDIA RTX 4050 Laptop GPU), so `launch/abb_irb140_perception.launch.py`
-now passes `parameters=[{"device": "0"}]` to route inference to the GPU
-instead of the CPU. **Rebuild before this takes effect**
-(`colcon build --packages-select abb_irb140_perception`, then re-source), and
-watch the "Dropping ball detection" staleness figures in the log — they
-should now be tens of milliseconds during genuinely fast motion, not
-seconds. If a GPU isn't available on a given machine, `device` can be
-overridden back to `"cpu"` via `--ros-args -p device:=cpu`, but expect the
-same backlog symptom to return, or reduce `imgsz` to cut per-frame inference
-cost instead.
+1. Look up the transform at the depth image's exact stamp, waiting up to
+   `tf_timeout`.
+2. If TF hasn't caught up (`ExtrapolationException`), fall back to the latest
+   available transform, but **only** if that transform is within
+   `max_tf_staleness` of the capture stamp. Otherwise the detection is dropped
+   and a `Dropping ball detection: ... ms from the image's capture stamp`
+   warning is logged.
 
-This is an important distinction for writing this up: the TF-staleness fix
-(`max_tf_staleness`) didn't cause this backlog — it was always there,
-silently absorbed by the old unbounded fallback, which is exactly what made
-the original bug ("perfect when stopped, wrong while moving") so easy to
-miss. The fix didn't introduce a new failure mode; it turned an invisible
-one into a visible, diagnosable one.
+A dropped frame publishes no TF, Detection3D or ADD marker. A missing
+detection is far safer for pick logic than a confidently wrong one, so
+**consumers should check the age of the `ball` TF** rather than assume it is
+fresh (`abb_irb140_motion_control`'s `ball_follow_node` and `move_to_ball_node`
+do this with `max_tf_age_sec`).
 
-### A third, deeper problem: the node's own executor could starve its TF listener
+`max_tf_staleness` is sized as
+`acceptable_position_error / max_tool_speed`. At an eye-in-hand approach speed
+of 0.3–0.5 m/s, 30 ms bounds the error to about 1–1.5 cm. Retune it to your
+rig's real end-effector speed.
 
-Even after switching inference to the GPU, live testing during *real*
-MoveIt-executed pick trajectories (as opposed to simple manual joint jogs)
-still reproduced a large, consistent **~4.7 s** staleness — reproducing even
-from a cold restart of the whole stack, so it wasn't gradual drift or GPU
-warm-up. With `max_tf_staleness` in place this correctly dropped every
-detection during the stale window rather than publishing a wrong position,
-but with no trustworthy detection available during the pick's critical
-approach window, the grasp executed against stale/cached information and
-knocked the ball off the table.
+### Why the node is built this way
 
-Direct measurement against the live system narrowed this down precisely:
-- `ros2 topic hz /joint_states`, sampled during one of these exact stale
-  windows, stayed a healthy 64-102 Hz throughout — the underlying joint
-  state / TF *source* was not gapping for anywhere near 4.7 s.
-- The node's own detection-output cadence stayed ~170-200 ms between
-  messages throughout the same window — no single call to `_process()` was
-  itself blocking for ~4.7 real seconds; many fast calls in a row were all
-  seeing the same stale "latest" TF.
-- A standalone probe node (its own process, own `tf2_ros.Buffer`/
-  `TransformListener`, subscribed to the same `/tf` and depth image topics)
-  measured only 10-50 ms of lag during two manual jog motions. Only a real,
-  fully-loaded MoveIt trajectory execution reproduced the multi-second stall
-  inside the actual perception node.
+These three problems were found in turn while chasing a ball position that
+was right when the arm was still and wrong (by centimetres) while it moved.
+Each one explains a piece of the current code.
 
-The root cause: `main()` spun the node with plain `rclpy.spin(node)`, i.e.
-rclpy's default `SingleThreadedExecutor`. `tf2_ros.TransformListener`
-(constructed at `perception_node.py` ~line 504-511) deliberately places its
-`/tf`/`/tf_static` subscriptions in their own `ReentrantCallbackGroup` — its
-own source comments explain this exists specifically so TF updates aren't
-blocked by other callbacks — but that separation only pays off under a
-multi-threaded executor. Under a single thread, the image-processing
-callback (in the node's implicit default `MutuallyExclusiveCallbackGroup`)
-and the TF listener's callback still serialize on the same OS thread
-regardless of callback group. A real MoveIt trajectory generates far more
-ROS 2 executor activity (controller feedback, planning-scene/octomap
-traffic, etc.) than a manual jog, consistent with the single thread
-occasionally starving the TF listener's callback group for several seconds
-under that heavier load while still getting around to servicing image
-callbacks — matching every measurement above.
+1. **Unbounded latest-TF fallback.** The original fallback accepted any
+   transform, however old. It looked fine at rest (every transform was
+   identical) and failed only during motion. Diagnosed from a bag of `/tf` and
+   `/joint_states` with a stationary ball: the published position swung about
+   7.7 cm (x), 22.3 cm (y) and 7.3 cm (z), tracking exactly the periods when
+   the joints were moving. Fixed with `max_tf_staleness`, and by stamping every
+   output from the depth image rather than mixing in the RGB stamp (the two
+   can differ by up to `slop`, 50 ms).
+2. **CPU inference backlog.** With `device: cpu`, YOLO competed with Gazebo
+   for CPU and the node fell steadily behind (a constant ~4.7 s of staleness
+   on every frame). `ApproximateTimeSynchronizer` queues frames rather than
+   dropping them, so this looked like TF lag. The launch file now runs
+   inference on the GPU. If you must use CPU, lower `imgsz`.
+3. **Executor starving the TF listener.** With plain `rclpy.spin()`, the image
+   callback and `tf2_ros.TransformListener` shared one thread. Under the
+   heavier load of a real MoveIt trajectory (as opposed to a manual joint
+   jog) the TF buffer could lag by ~4.7 s even though `/joint_states` was
+   arriving at 64–102 Hz. `main()` now uses
+   `MultiThreadedExecutor(num_threads=4)` so the listener's own callback
+   group gets a separate lane. The image callback is still serialised by
+   its default mutually-exclusive callback group; the only shared state is the
+   thread-safe `tf2_ros.Buffer`.
 
-**Fix:** `main()` now spins the node with an explicit
-`rclpy.executors.MultiThreadedExecutor(num_threads=4)` instead of plain
-`rclpy.spin(node)`. No other code changes were needed — the TF listener
-already had its own callback group, and every other subscription/publisher
-in this node already shared the default group with each other, so this was
-exactly the two-lane split needed. `num_threads=4` matches the convention
-already used by other hand-rolled nodes in the sibling `hybraut_irb140`
-package (which pair `ReentrantCallbackGroup` with an explicit
-`MultiThreadedExecutor(num_threads=4)`), and comfortably covers this node's
-two real concurrency lanes without oversubscribing a process that also does
-GPU-bound inference. The only shared state between the two lanes is
-`self._tf_buffer` itself, which `tf2_ros`'s core is specifically designed to
-be thread-safe for (concurrent reads against background writes) — the exact
-pattern `TransformListener`'s own `spin_thread=True` option relies on.
+To check a change end to end, run a real MoveIt-executed pick (not just a
+manual jog) against a stationary ball and confirm both that
+`Dropping ball detection` warnings appear only during genuinely fast motion,
+and that the ball is not disturbed. To reset the simulated ball:
 
-### Verifying the fix
+```bash
+gz service -s /world/robot_lab/set_pose --reqtype gz.msgs.Pose \
+  --reptype gz.msgs.Boolean \
+  --req 'name: "my_sphere", position: {x: 0.55, y: 0.165182, z: 1.086870}, orientation: {w: 1.0}'
+gz model -m my_sphere -p   # read back the ground-truth pose
+```
 
-The bug reproduction bag only contains `/tf`/`/tf_static`/`/joint_states` (no
-raw camera data), so it can't drive the node end-to-end, but it's enough to
-sanity-check the timing assumption: replaying it and checking that the
-staleness measured by the new fallback logic spikes exactly during the same
-arm-moving windows that produced the original 7.7/22.3/7.3 cm swings.
+## Validation
 
-Full end-to-end verification needs a live/sim run: launch
-`abb_irb140_perception.launch.py`, move the arm through a similar sweep with
-a stationary ball, record a new `/tf` + `/joint_states` bag the same way, and
-confirm the `base_link -> ball` position no longer swings by cm-scale amounts
-during motion. Watch the node's log for the new "Dropping ball detection"
-warnings — they should appear only during genuinely fast motion, not
-constantly; if they're constant, `tf_timeout` and/or `max_tf_staleness` need
-to be raised.
+`notebooks/validate_transform_pipeline.ipynb` checks the static
+`depth_camera_optical -> base_link` chain and the detector geometry against
+Gazebo ground truth (`gz model -m my_sphere -p`). It is a **stationary-arm**
+test and does not cover motion, which is what the TF handling above is for.
 
-The real test for the executor fix is a full MoveIt-executed pick attempt
-(not just a manual jog), since that's what reproduced the ~4.7 s stall.
-Reset the ball to its spawn pose if needed
-(`gz service -s /world/robot_lab/set_pose --reqtype gz.msgs.Pose --reptype
-gz.msgs.Boolean --req 'name: "my_sphere", position: {x: 0.55, y: 0.165182,
-z: 1.086870}, orientation: {w: 1.0}'`) and confirm via `gz model -m my_sphere
--p` that a pick attempt no longer knocks it off the table.
+- Test 1 projects the ground-truth ball into the image through forward
+  kinematics and compares the depth there (no detector involved).
+- Test 2 runs YOLO plus the same back-projection and radius correction as the
+  node and reports the world-frame error against a 5 cm tolerance.
+- `notebooks/perception_inputs_multi/pos1..pos4/` are tracked single-frame
+  captures (`rgb.png`, `depth.npz`, `camera_info.yaml`, ground truth) at four
+  other ball positions. `notebooks/perception_inputs/` (a ~3 GB bag) is
+  gitignored, so only the multi-position section runs from a fresh clone.
 
-### Known follow-up (not yet applied)
+The notebook predates the current file layout: it refers to
+`abb_irb140_perception_node.py` (now `perception_node.py`) and runs YOLO on
+CPU.
 
-A separate, structurally similar node in the sibling `hybraut_irb140`
-package (`hybraut_irb140_ball_detector`, used by
-`abb_irb140_bringup`'s launch file) has the same unguarded
-latest-transform-fallback pattern in its own `_transform_point()`, and would
-benefit from the same bounded-staleness fix if/when that node is in active
-use. It does not have the depth/RGB stamp-mismatch issue described above —
-it already uses one consistent timestamp source. Worth checking separately
-whether it spins on a `SingleThreadedExecutor` too, since it would be
-susceptible to the same TF-listener-starvation issue described above if so.
+## Local-only artefacts (gitignored)
+
+`docs/` and `bags/` are not in the repository. On the development machine:
+
+- `docs/initial_perception_to_transform_pipeline.mp4`: the pipeline working
+  with the arm stationary.
+- `docs/perception_tranformation_error_while_in_motion.mp4`: the motion bug.
+- `docs/perception_fix.mp4`: after the fix.
+- `docs/real_robot_perception_and_translation_demo.mp4`: the real robot.
+- `bags/rosbag2_2026_09_17-17_14_02/` and `bags/ball_ground_truth.txt`: the
+  `/tf`, `/tf_static`, `/joint_states` bag and ground truth used to diagnose
+  the motion bug. It has no camera data, so it cannot drive the node.
+
+## Package layout
+
+```
+abb_irb140_perception/perception_node.py   # BallDetector node and main()
+launch/abb_irb140_perception.launch.py     # sets device=0 and use_sim_time
+notebooks/                                 # transform-pipeline validation
+test/                                      # ament copyright / flake8 / pep257
+```
+
+## Known issues and follow-ups
+
+- `package.xml` still has placeholder description and license and does not
+  list runtime dependencies (`hybraut_irb140`, `rclpy`, the message packages,
+  `ultralytics`/`torch`).
+- `abb_irb140_bringup` starts `hybraut_irb140`'s own
+  `hybraut_irb140_ball_detector`, not this node. That detector still has the
+  unbounded latest-TF fallback and spins on plain `rclpy.spin()`, so it is
+  exposed to problems 1 and 3 above. It also needs a
+  `camera_optical_frame_override` for the reason given in
+  [Pipeline](#pipeline). Do not run both detectors at once: they share the node
+  name `/hybraut/ball_detector`, the output topics and the `ball` TF.
+- Detections are per-frame with no tracking or filtering; the ball position
+  is not smoothed across frames.
